@@ -67,7 +67,7 @@ This streams MJPEG video with low latency to your WSL-based vision system.
 
 ## 2. On the WSL2 (Linux) Side: Launch the Vision Client
 
-### Step 1: Navigate to the `ros_arm_vision` folder
+### Step 1: Download and Navigate to the `ros_arm_vision` folder.
 
 ```bash
 cd ~/ros_arm_vision
