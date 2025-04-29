@@ -39,7 +39,7 @@ Look for your video device in the output:
 
 Copy the exact name shown in quotes.
 
-### Step 3: Get the WSL2 IP Address
+### Step 3: Get the WSL2 IP Address from your Windows Side
 
 Run the following in Command Prompt or PowerShell:
 
