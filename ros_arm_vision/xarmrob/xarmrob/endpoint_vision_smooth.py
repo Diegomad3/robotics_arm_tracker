@@ -29,7 +29,7 @@ class HandEndpointNode(Node):
         super().__init__('hand_endpoint')
 
         # ── parameters ──────────────────────────────────────────────────────────
-        self.command_frequency = float(self.declare_parameter('command_frequency', 10).value)
+        self.command_frequency = float(self.declare_parameter('command_frequency', 1).value)
         self.endpoint_speed    = float(self.declare_parameter('endpoint_speed', 0.05).value)
         self.movement_time_ms  = round(1000.0 / self.command_frequency)
 
@@ -38,6 +38,15 @@ class HandEndpointNode(Node):
         self.disp_traj    = [self.old_xyz_goal.copy()]
         self.idx          = 0
         self.new_goal_tol = 0.02  # only re-traj if hand moved >2cm
+
+        # Calibration
+
+        self.calibration = {
+            "x": 0.0, "y": 0.0, "z": 0.0,
+            "depth_base_wrist_index": 0.0,
+            "depth_base_knuckle_knuckle": 0.0
+        }
+        self.is_calibrated = False
 
         # ── publisher + timer ─────────────────────────────────────────────────
         cbg = ReentrantCallbackGroup()
@@ -61,9 +70,10 @@ class HandEndpointNode(Node):
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
+        self.mp_draw = mp.solutions.drawing_utils
         stream_url = self.get_udp_stream_url()
         self.cap = cv2.VideoCapture(stream_url)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
         if not self.cap.isOpened():
             self.get_logger().error(f'Failed to open UDP stream: {stream_url}')
             raise RuntimeError('Couldn’t open video stream')
@@ -112,58 +122,136 @@ class HandEndpointNode(Node):
             if not res.multi_hand_landmarks:
                 continue
 
-            lm = res.multi_hand_landmarks[0]
-            w, h, _ = frame.shape
+            if res.multi_hand_landmarks:
+                for hand_landmarks in res.multi_hand_landmarks:
+                    h, w, _ = frame.shape
 
-            # choose coordinates & depth‐score per your original logic
-            wrist     = lm.landmark[self.mp_hands.HandLandmark.WRIST]
-            index_mcp = lm.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
-            pinky_mcp = lm.landmark[self.mp_hands.HandLandmark.PINKY_MCP]
+                    wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
+                    index_mcp = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
+                    pinky_mcp = hand_landmarks.landmark[self.mp_hands.HandLandmark.PINKY_MCP]
+                    index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                    thumb_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP]
+                    pinky_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.PINKY_TIP]
 
-            angle_w = self.calculate_angle(index_mcp, wrist, pinky_mcp)
-            use_knuckle = angle_w > 45
-            if use_knuckle:
-                base_dist = np.linalg.norm(
-                    np.array([index_mcp.x, index_mcp.y, -index_mcp.z]) -
-                    np.array([pinky_mcp.x, pinky_mcp.y, -pinky_mcp.z])
-                )
-            else:
-                base_dist = np.linalg.norm(
-                    np.array([index_mcp.x, index_mcp.y, -index_mcp.z]) -
-                    np.array([wrist.x,    wrist.y,    -wrist.z])
-                )
+                    angle_at_wrist = self.calculate_angle(index_mcp, wrist, pinky_mcp)
+                    use_knuckle_distance = angle_at_wrist > 45
 
-            # simple depth‐score → meters
-            wrist_z_scaled = -wrist.z * 100
-            raw_score      = wrist_z_scaled + base_dist * 300
-            z_m = raw_score * 0.001
+                    base_dist = math.sqrt(
+                        (index_mcp.x - pinky_mcp.x) ** 2 +
+                        (index_mcp.y - pinky_mcp.y) ** 2 +
+                        ((-index_mcp.z) - (-pinky_mcp.z)) ** 2
+                    ) if use_knuckle_distance else math.sqrt(
+                        (index_mcp.x - wrist.x) ** 2 +
+                        (index_mcp.y - wrist.y) ** 2 +
+                        ((-index_mcp.z) - (-wrist.z)) ** 2
+                    )
 
-            # x,y from normalized image coords → meters
-            x_m = (wrist.x * w -  w/2) * 0.001
-            y_m = (h/2 - wrist.y * h) * 0.001
+                    wrist_z_raw = wrist.z - self.calibration["z"] if self.is_calibrated else wrist.z
+                    wrist_z_scaled = -wrist_z_raw * 100
+                    raw_score = wrist_z_scaled + base_dist * 300
 
-            raw_goal = np.array([x_m, y_m, z_m])
+                    if self.is_calibrated:
+                        base = self.calibration["depth_base_knuckle_knuckle"] if use_knuckle_distance else self.calibration["depth_base_wrist_index"]
+                        depth_score = 50 + (raw_score - base)
+                    else:
+                        depth_score = raw_score
+
+                    dist_thumb_index = math.sqrt(
+                        (thumb_tip.x - index_tip.x) ** 2 +
+                        (thumb_tip.y - index_tip.y) ** 2 +
+                        (thumb_tip.z - index_tip.z) ** 2
+                    )
+                    dist_pinky_thumb = math.sqrt(
+                        (thumb_tip.x - pinky_tip.x) ** 2 +
+                        (thumb_tip.y - pinky_tip.y) ** 2 +
+                        (thumb_tip.z - pinky_tip.z) ** 2
+                    )
+
+                    if dist_pinky_thumb < 0.05:
+                        wrist_z_scaled = -wrist.z * 100
+                        dist_wrist_index = math.sqrt(
+                            (index_mcp.x - wrist.x) ** 2 +
+                            (index_mcp.y - wrist.y) ** 2 +
+                            ((-index_mcp.z) - (-wrist.z)) ** 2
+                        )
+                        dist_knuckle_knuckle = math.sqrt(
+                            (index_mcp.x - pinky_mcp.x) ** 2 +
+                            (index_mcp.y - pinky_mcp.y) ** 2 +
+                            ((-index_mcp.z) - (-pinky_mcp.z)) ** 2
+                        )
+                        self.calibration.update({
+                            "depth_base_wrist_index": wrist_z_scaled + dist_wrist_index * 300,
+                            "depth_base_knuckle_knuckle": wrist_z_scaled + dist_knuckle_knuckle * 300,
+                            "x": wrist.x,
+                            "y": wrist.y,
+                            "z": wrist.z
+                        })
+                        self.is_calibrated = True
+                        self.get_logger().info(
+                            coloredtext(250,0,0,
+                                'CALIBRATED'
+                            )
+                        )
+
+                    wx, wy = int(wrist.x * w), int(wrist.y * h)
+                    wrist_x = wrist.x - self.calibration["x"] if self.is_calibrated else wrist.x
+                    wrist_y = wrist.y - self.calibration["y"] if self.is_calibrated else wrist.y
+
+            x_scale = -1 * wrist_y / 1.5 /2
+            y_scale = -1 * wrist_x / 1.5
+            #z_scale = wrist_z_scaled / 1.5
+
+            depth_score_norm = np.clip((depth_score - 20) / 100, 0, 1)
+            z_scale = 0.05 + 0.3 * depth_score_norm
+
+            raw_goal = np.array([x_scale, y_scale, z_scale])
+
+            ang = np.arctan2(y_scale, x_scale)
+            mag = np.sqrt(x_scale ** 2 + y_scale ** 2)
+
+            mag_clamp = np.clip(mag, 0.04, 0.2)
+
+            clamp_goal = np.array([mag_clamp * np.cos(ang), mag_clamp * np.sin(ang), z_scale])
+
+            self.get_logger().info(f'z Value: {str(z_scale)}')
+    
+            # clamp_max = np.array([0.18, 0.18, 0.1])
+            # clamp_min = np.array([-0.18, -0.18, 0.1])
+
+            # clamp_goal = np.clip(clamp_goal, clamp_min, clamp_max)
+
+            self.get_logger().info(f'detected hand position: {str(clamp_goal)}')
+
+            # if ret:
+            #     cv2.imshow("Hand Tracker (UDP)", frame)
 
             # if moved > tol, rebuild disp_traj
             if np.linalg.norm(raw_goal - self.old_xyz_goal) > self.new_goal_tol:
                 self.get_logger().info(
                     coloredtext(50,255,50,
-                        f' New hand‐goal: [{raw_goal[0]:.3f}, {raw_goal[1]:.3f}, {raw_goal[2]:.3f}]'
+                        f' New hand‐goal: [{clamp_goal[0]:.3f}, {clamp_goal[1]:.3f}, {clamp_goal[2]:.3f}]'
                     )
                 )
-                # minimum-jerk from old → new
+                self.get_logger().info(
+                    coloredtext(50,255,250,
+                        f' New raw-goal: [{raw_goal[0]:.3f}, {raw_goal[1]:.3f}, {raw_goal[2]:.3f}]'
+                    )
+                )
+                #minimum-jerk from old → new
                 _, traj = smoo.minimum_jerk_interpolation(
                     self.old_xyz_goal,
-                    raw_goal,
+                    clamp_goal,
                     self.endpoint_speed,
                     self.command_frequency
                 )
-                self.disp_traj = [pt.tolist() for pt in traj]
+                #self.disp_traj = [pt.tolist() for pt in traj]
+                #self.disp_traj = [[0.15, 0.15, 0.05]]
+                self.disp_traj = [clamp_goal]
                 self.idx        = 0
-                self.old_xyz_goal = raw_goal.copy()
+                self.old_xyz_goal = clamp_goal.copy()
 
             # tiny sleep so this loop doesn't spin at 100%
-            time.sleep(1.0 / (self.command_frequency * 2))
+            # time.sleep(1.0 / (self.command_frequency * 2))
 
 
     def send_endpoint_desired(self):
@@ -178,6 +266,13 @@ class HandEndpointNode(Node):
         msg = ME439PointXYZ()
         msg.xyz = xyz
         self.pub.publish(msg)
+
+        
+        self.get_logger().info(
+            coloredtext(0,0,250,
+                'PUBLISHED'
+            )
+        )
 
 
 def main(args=None):

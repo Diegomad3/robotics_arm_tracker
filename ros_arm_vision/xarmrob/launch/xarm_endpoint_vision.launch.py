@@ -34,6 +34,18 @@ def generate_launch_description():
             output='screen',
             parameters=[params_file]
         ),
+	        Node(
+            package='xarmrob',
+            executable='command_xarm',
+            name='command_xarm',
+            parameters=[params_file]
+        ),
+        Node(
+            package='xarmrob',
+            executable='xarm_kinematics',
+            name='xarm_kinematics',
+            parameters=[params_file]
+        ),
 
         # Robot state publisher for transforms
         Node(
